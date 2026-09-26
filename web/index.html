@@ -1,4 +1,107 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:15px system-ui;max-width:1040px;margin:28px auto;padding:0 16px;color:#222}
+select,input,button,textarea{padding:7px;margin:3px;font:inherit}
+textarea{width:100%;box-sizing:border-box}
+button{cursor:pointer;border-radius:5px;border:1px solid #888;background:#fff}
+button.primary{background:#2b6cb0;color:#fff;border-color:#2b6cb0}
+button.danger{color:#b00020;border-color:#b00020}
+.panel{border:1px solid #bbb;padding:14px 16px;border-radius:8px;margin:14px 0}
+.panel h2{font-size:16px;margin:0 0 10px}
+pre{background:#f5f5f5;padding:10px;white-space:pre-wrap;border-radius:6px;max-height:340px;overflow:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f0f0f0}
+.pill{padding:1px 8px;border-radius:10px;font-size:12px}
+.pill.pending{background:#fff3cd}.pill.approved{background:#d4edda}.pill.rejected{background:#f8d7da}
+.muted{color:#666;font-size:13px}.err{color:#b00020}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+</style></head>
+<body>
+<h1>临床试验随机分配与盲法</h1>
+<div class="panel row">
+  <label>用户 <select id="user"><option value="coord">coord（项目协调员）</option><option value="monitor1">monitor1（监查员甲）</option><option value="monitor2">monitor2（监查员乙）</option><option value="site1">site1（中心一）</option><option value="site2">site2（中心二）</option></select></label>
+  <label>试验ID <input id="trial" value="1" size="5"></label>
+  <button class="primary" onclick="loadAll()">刷新</button>
+  <span id="trialInfo" class="muted"></span>
+</div>
+
+<div class="panel">
+  <h2>提交区组长度修订（协调员）</h2>
+  <div class="row">
+    <label>新区组长度 <input id="newBlock" type="number" min="2" step="2" value="6" style="width:90px"></label>
+  </div>
+  <textarea id="reason" rows="2" placeholder="修订原因（至少 8 字），例如：实际中心入组速度明显快于预期，需要更短的区组以减少组间失衡"></textarea>
+  <button class="primary" onclick="submitRevision()">提交修订（旧方案继续承接入组，等待审批）</button>
+  <span id="submitMsg" class="err"></span>
+</div>
+
+<div class="panel">
+  <h2>修订审批（监查员/协调员；申请人不可审批本人申请）</h2>
+  <table id="revTable"><thead><tr><th>ID</th><th>旧→新长度</th><th>原因</th><th>申请人</th><th>状态</th><th>审批人/备注/时间</th><th>操作</th></tr></thead><tbody></tbody></table>
+  <p class="muted">批准后，新长度只影响尚未使用的区组；已发出的编号、盲底和既往审计保持原样。拒绝时试验方案不变化。</p>
+</div>
+
+<div class="panel">
+  <h2>试验摘要与审计</h2>
+  <pre id="out">点击“刷新”加载。</pre>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+async function api(path,opts={}){
+  opts.headers=Object.assign({"X-User-Id":$("user").value,"Content-Type":"application/json"},opts.headers||{});
+  const r=await fetch(path,opts); const data=await r.json();
+  if(!r.ok) throw new Error(data.error?data.error.message:("HTTP "+r.status));
+  return data;
+}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+async function loadAll(){
+  $("submitMsg").textContent="";
+  const id=$("trial").value;
+  const s=await api(`/api/trials/${id}/summary`);
+  $("trialInfo").textContent=`${s.trial.name}（${s.trial.status}，方案 ${s.trial.protocol_version}）当前区组长度：${s.trial.block_size}；可见受试者 ${s.participants_visible} 例`;
+  renderRevisions(s.block_size_revisions||[]);
+  $("out").textContent=JSON.stringify(s,null,2);
+}
+
+function renderRevisions(items){
+  const tb=$("revTable").querySelector("tbody"); tb.innerHTML="";
+  if(!items.length){tb.innerHTML='<tr><td colspan="7" class="muted">暂无修订记录</td></tr>';return;}
+  for(const r of items){
+    const tr=document.createElement("tr");
+    const meta=r.status==="pending" ? '<span class="muted">待审</span>'
+      : `${esc(r.reviewer_id)}${r.review_note?"："+esc(r.review_note):""}<br><span class="muted">${esc(r.decided_at||"")}</span>`;
+    let actions="";
+    if(r.status==="pending"){
+      actions=`<button class="primary" onclick="decide(${r.id},true)">批准</button>
+               <button class="danger" onclick="decide(${r.id},false)">拒绝</button>`;
+    }
+    tr.innerHTML=`<td>${r.id}</td><td>${r.old_block_size} → <b>${r.new_block_size}</b></td>
+      <td>${esc(r.reason)}<br><span class="muted">${esc(r.created_at)}</span></td>
+      <td>${esc(r.requester_id)}</td><td><span class="pill ${r.status}">${({pending:"待审",approved:"已批准",rejected:"已拒绝"})[r.status]}</span></td>
+      <td>${meta}</td><td>${actions}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+async function submitRevision(){
+  $("submitMsg").textContent="";
+  try{
+    await api(`/api/trials/${$("trial").value}/block-size-revisions`,{method:"POST",
+      body:JSON.stringify({new_block_size:parseInt($("newBlock").value,10),reason:$("reason").value})});
+    $("reason").value=""; await loadAll();
+  }catch(e){$("submitMsg").textContent=e.message;}
+}
+async function decide(id,approve){
+  let note="";
+  if(!approve){note=prompt("拒绝理由（可留空）：","")??"";}
+  try{
+    await api(`/api/trials/${$("trial").value}/block-size-revisions/${id}/${approve?"approve":"reject"}`,
+      {method:"POST",body:JSON.stringify({note})});
+    await loadAll();
+  }catch(e){alert(e.message);}
+}
+</script>
+</body></html>

@@ -26,6 +26,9 @@ python3 -m unittest -v
 - `GET /api/trials/{id}/participants`：分中心返回数据，中心用户看不到其他中心。
 - `POST /api/participants/{id}/unblinding-requests`：发起揭盲。
 - `POST /api/unblinding-requests/{id}/approve`：两人独立审批；同一人不能审批两次。
-- `GET /api/trials/{id}/summary`：中心级汇总和审计记录。
+- `POST /api/trials/{id}/block-size-revisions`：试验进行中由协调员提交带原因的区组长度修订；同一试验只允许一个待审版本，待审期间旧方案继续承接入组。
+- `GET /api/trials/{id}/block-size-revisions`：协调员/监查员回看全部修订（可用 `?status=pending` 筛选待审版本）。
+- `POST /api/trials/{id}/block-size-revisions/{rid}/approve|reject`：监查员或协调员审批；申请人与审批人相同一律拒绝。批准后新长度只影响尚未使用的区组，已发编号、盲底和既往审计保持原样；拒绝时方案不变。
+- `GET /api/trials/{id}/summary`：中心级汇总、区组长度修订记录和审计记录。
 
 随机表按“试验种子 + 中心 + 分层因素”确定性生成，每个区组为分组数的整数倍并打乱；分配在 SQLite `BEGIN IMMEDIATE` 事务中原子占用。实现适合作为流程原型，不替代经认证的临床试验随机化系统。
