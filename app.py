@@ -82,6 +82,16 @@ class RandomizationStore:
                     enrolled_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
                     UNIQUE(trial_id,external_id)
                 );
+                CREATE TABLE IF NOT EXISTS block_size_revisions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    current_block_size INTEGER NOT NULL, proposed_block_size INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+                    requested_by TEXT NOT NULL REFERENCES users(id),
+                    decided_by TEXT REFERENCES users(id),
+                    created_at TEXT NOT NULL, decided_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS unblinding_requests(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     participant_id INTEGER NOT NULL REFERENCES participants(id),
@@ -227,8 +237,7 @@ class RandomizationStore:
                 rng = random.Random(f"{trial['seed']}:{stratum['stratum_key']}:{block_no}")
                 arms = json.loads(trial["arms_json"])
                 plan = []
-                blocks = len(arms) if trial["block_size"] > len(arms) else 1
-                for _ in range(blocks * (trial["block_size"] // len(arms))):
+                for _ in range(trial["block_size"] // len(arms)):
                     plan.extend(arms)
                 rng.shuffle(plan)
                 start = conn.execute(
@@ -375,6 +384,97 @@ class RandomizationStore:
                 conn.rollback()
                 raise
 
+    @staticmethod
+    def _revision_dict(row):
+        return {
+            "id": row["id"], "trial_id": row["trial_id"],
+            "current_block_size": row["current_block_size"],
+            "proposed_block_size": row["proposed_block_size"],
+            "reason": row["reason"], "status": row["status"],
+            "requested_by": row["requested_by"], "decided_by": row["decided_by"],
+            "created_at": row["created_at"], "decided_at": row["decided_at"],
+        }
+
+    def submit_block_size_revision(self, user_id, trial_id, block_size, reason):
+        reason = str(reason).strip()
+        if len(reason) < 8:
+            raise BusinessError("修订原因至少 8 字", 422, "reason_required")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator"})
+                trial = self._trial(conn, trial_id)
+                if trial["status"] != "running":
+                    raise BusinessError("只有入组中的试验可以提交区组长度修订", 409, "invalid_status")
+                arms = json.loads(trial["arms_json"])
+                if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < len(arms) or block_size % len(arms):
+                    raise BusinessError("区组长度必须为试验组数的正整数倍", 422, "invalid_block_size")
+                if block_size == trial["block_size"]:
+                    raise BusinessError("新区组长度与现行长度相同", 422, "unchanged_block_size")
+                pending = conn.execute(
+                    "SELECT id FROM block_size_revisions WHERE trial_id=? AND status='pending'", (trial_id,)
+                ).fetchone()
+                if pending:
+                    raise BusinessError("已有待审批的区组长度修订", 409, "revision_pending")
+                cur = conn.execute(
+                    """INSERT INTO block_size_revisions(trial_id,current_block_size,proposed_block_size,reason,requested_by,created_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (trial_id, trial["block_size"], block_size, reason, user_id, now()),
+                )
+                revision_id = cur.lastrowid
+                self._audit(conn, trial_id, user_id, "block_size_revision.submit",
+                            {"revision_id": revision_id, "current_block_size": trial["block_size"], "proposed_block_size": block_size, "reason": reason})
+                row = conn.execute("SELECT * FROM block_size_revisions WHERE id=?", (revision_id,)).fetchone()
+                return self._revision_dict(row)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def list_block_size_revisions(self, user_id, trial_id):
+        with self.connect() as conn:
+            self._user(conn, user_id, {"site", "coordinator", "monitor"})
+            self._trial(conn, trial_id)
+            rows = conn.execute(
+                "SELECT * FROM block_size_revisions WHERE trial_id=? ORDER BY id", (trial_id,)
+            ).fetchall()
+            return [self._revision_dict(row) for row in rows]
+
+    def decide_block_size_revision(self, user_id, revision_id, approve):
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator", "monitor"})
+                revision = conn.execute("SELECT * FROM block_size_revisions WHERE id=?", (revision_id,)).fetchone()
+                if not revision:
+                    raise BusinessError("区组长度修订不存在", 404, "not_found")
+                if revision["status"] != "pending":
+                    raise BusinessError("该修订已经完成审批", 409, "already_decided")
+                if revision["requested_by"] == user_id:
+                    raise BusinessError("申请人与审批人不得为同一人", 409, "self_decision_forbidden")
+                trial = self._trial(conn, revision["trial_id"])
+                if approve:
+                    if trial["status"] != "running":
+                        raise BusinessError("试验不在入组中，不能批准区组长度修订", 409, "invalid_status")
+                    conn.execute(
+                        "UPDATE block_size_revisions SET status='approved',decided_by=?,decided_at=? WHERE id=?",
+                        (user_id, now(), revision_id),
+                    )
+                    conn.execute("UPDATE trials SET block_size=? WHERE id=?", (revision["proposed_block_size"], trial["id"]))
+                    self._audit(conn, trial["id"], user_id, "block_size_revision.approve",
+                                {"revision_id": revision_id, "old_block_size": trial["block_size"], "new_block_size": revision["proposed_block_size"]})
+                else:
+                    conn.execute(
+                        "UPDATE block_size_revisions SET status='rejected',decided_by=?,decided_at=? WHERE id=?",
+                        (user_id, now(), revision_id),
+                    )
+                    self._audit(conn, trial["id"], user_id, "block_size_revision.reject",
+                                {"revision_id": revision_id, "proposed_block_size": revision["proposed_block_size"]})
+                row = conn.execute("SELECT * FROM block_size_revisions WHERE id=?", (revision_id,)).fetchone()
+                return self._revision_dict(row)
+            except Exception:
+                conn.rollback()
+                raise
+
     def trial_summary(self, user_id, trial_id):
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
@@ -388,7 +488,7 @@ class RandomizationStore:
             ).fetchall()
             audit = conn.execute("SELECT * FROM audit_log WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
             return {
-                "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"]},
+                "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"], "block_size": trial["block_size"]},
                 "participants_visible": total, "by_site": [dict(x) for x in by_site],
                 "audit": [dict(x) | {"detail": json.loads(x["detail"])} for x in audit],
             }
@@ -426,11 +526,17 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
+            if len(parts)==4 and parts[3]=="block-size-revisions" and method=="POST":
+                d=self._body(); return self._send(201, store.submit_block_size_revision(user,trial_id,d.get("block_size"),d.get("reason","")))
+            if len(parts)==4 and parts[3]=="block-size-revisions" and method=="GET":
+                return self._send(200, {"items": store.list_block_size_revisions(user,trial_id)})
         if len(parts)==3 and parts[:2]==["api","participants"] and method=="GET": return self._send(200, store.get_participant(user,int(parts[2])))
         if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="unblinding-requests" and method=="POST":
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))
         if len(parts)==4 and parts[:2]==["api","unblinding-requests"] and parts[3]=="approve" and method=="POST":
             return self._send(200, store.approve_unblinding(user,int(parts[2])))
+        if len(parts)==4 and parts[:2]==["api","block-size-revisions"] and parts[3] in ("approve","reject") and method=="POST":
+            return self._send(200, store.decide_block_size_revision(user,int(parts[2]),parts[3]=="approve"))
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)

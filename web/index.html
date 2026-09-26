@@ -1,4 +1,29 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>临床试验随机化</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>临床试验随机分配与盲法</h1><div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1"><button onclick="load()">查看试验摘要</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/trials/${trial.value}/summary`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,button,input{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}table{border-collapse:collapse;width:100%;margin-top:8px}td,th{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:14px}tr.pending{background:#fff8e1}tr.approved{background:#e8f5e9}tr.rejected{background:#ffebee}#msg{color:#b00020}</style></head>
+<body><h1>临床试验随机分配与盲法</h1>
+<div class="panel"><select id="user"><option>site1</option><option>site2</option><option>coord</option><option>monitor1</option><option>monitor2</option></select><input id="trial" value="1" size="4"><button onclick="load()">查看试验摘要</button><span id="msg"></span></div>
+<div class="panel"><h2>区组长度修订</h2>
+<div>当前生效区组长度：<b id="cur">-</b>（修订待审期间仍按现行长度入组；批准后只影响尚未生成的区组）</div>
+<div><input id="newSize" type="number" min="2" placeholder="新区组长度"><input id="reason" size="42" placeholder="修订原因（至少 8 字）"><button onclick="submitRevision()">提交修订</button></div>
+<table><thead><tr><th>#</th><th>现行 → 提议</th><th>原因</th><th>申请人</th><th>状态</th><th>审批人</th><th>申请 / 审批时间</th><th>操作</th></tr></thead><tbody id="revs"></tbody></table></div>
+<pre id="out"></pre>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(path,opts={}){const r=await fetch(path,{headers:{"X-User-Id":$("user").value,"Content-Type":"application/json"},...opts});const d=await r.json();if(!r.ok)throw new Error(d.error?.message||r.status);return d}
+async function load(){$("msg").textContent="";try{
+const s=await api(`/api/trials/${$("trial").value}/summary`);
+$("cur").textContent=s.trial.block_size??"-";
+$("out").textContent=JSON.stringify(s,null,2);
+await loadRevisions();}catch(e){$("msg").textContent=e.message}}
+async function loadRevisions(){
+const d=await api(`/api/trials/${$("trial").value}/block-size-revisions`);
+const names={pending:"待审批",approved:"已批准",rejected:"已拒绝"};
+$("revs").innerHTML=d.items.map(r=>`<tr class="${r.status}"><td>${r.id}</td><td>${r.current_block_size} → ${r.proposed_block_size}</td><td>${esc(r.reason)}</td><td>${esc(r.requested_by)}</td><td>${names[r.status]}</td><td>${esc(r.decided_by)}</td><td>${esc(r.created_at)}${r.decided_at?"<br>"+esc(r.decided_at):""}</td><td>${r.status==="pending"?`<button onclick="decide(${r.id},'approve')">批准</button><button onclick="decide(${r.id},'reject')">拒绝</button>`:""}</td></tr>`).join("")}
+async function submitRevision(){$("msg").textContent="";try{
+await api(`/api/trials/${$("trial").value}/block-size-revisions`,{method:"POST",body:JSON.stringify({block_size:Number($("newSize").value),reason:$("reason").value})});
+$("newSize").value="";$("reason").value="";await load()}catch(e){$("msg").textContent=e.message}}
+async function decide(id,action){$("msg").textContent="";try{
+await api(`/api/block-size-revisions/${id}/${action}`,{method:"POST"});await load()}catch(e){$("msg").textContent=e.message}}
+load();
+</script></body></html>
